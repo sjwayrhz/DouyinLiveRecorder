@@ -1,11 +1,11 @@
 ﻿# -*- encoding: utf-8 -*-
 
 """
-Author: Hmily
+Author: sjwayrhz
 GitHub: https://github.com/sjwayrhz
 Date: 2023-07-17 23:52:05
 Update: 2025-10-23 19:48:05
-Copyright (c) 2023-2025 by Hmily, All Rights Reserved.
+Copyright (c) 2026 by sjwayrhz, All Rights Reserved.
 Function: Record live stream video.
 """
 import asyncio
@@ -53,6 +53,7 @@ error_window_size = 10
 error_threshold = 5
 monitoring = 0
 running_list = []
+already_notified_removed = set()  # 记录已经提示过"URL已删除"的地址，避免同一条反复刷屏
 url_tuples_list = []
 url_comments = []
 text_no_repeat_url = []
@@ -192,6 +193,8 @@ def segment_video(converts_file_path: str, segment_save_file_path: str, segment_
         if os.path.exists(converts_file_path) and os.path.getsize(converts_file_path) > 0:
             ffmpeg_command = [
                 "ffmpeg",
+                "-fflags", "+discardcorrupt",
+                "-err_detect", "ignore_err",
                 "-i", converts_file_path,
                 "-c:v", "copy",
                 "-c:a", "copy",
@@ -222,7 +225,10 @@ def converts_mp4(converts_file_path: str, is_original_delete: bool = True) -> No
             if converts_to_h264:
                 color_obj.print_colored("正在转码为MP4格式并重新编码为h264\n", color_obj.YELLOW)
                 ffmpeg_command = [
-                    "ffmpeg", "-i", converts_file_path,
+                    "ffmpeg",
+                    "-fflags", "+discardcorrupt",
+                    "-err_detect", "ignore_err",
+                    "-i", converts_file_path,
                     "-c:v", "libx264",
                     "-preset", "veryfast",
                     "-crf", "23",
@@ -233,7 +239,10 @@ def converts_mp4(converts_file_path: str, is_original_delete: bool = True) -> No
             else:
                 color_obj.print_colored("正在转码为MP4格式\n", color_obj.YELLOW)
                 ffmpeg_command = [
-                    "ffmpeg", "-i", converts_file_path,
+                    "ffmpeg",
+                    "-fflags", "+discardcorrupt",
+                    "-err_detect", "ignore_err",
+                    "-i", converts_file_path,
                     "-c:v", "copy",
                     "-c:a", "copy",
                     "-f", "mp4", converts_file_path.rsplit('.', maxsplit=1)[0] + ".mp4",
@@ -378,6 +387,7 @@ def clear_record_info(record_name: str, record_url: str) -> None:
     recording.discard(record_name)
     if record_url in url_comments and record_url in running_list:
         running_list.remove(record_url)
+        already_notified_removed.discard(record_url)
         monitoring -= 1
         color_obj.print_colored(f"[{record_name}]已经从录制列表中移除\n", color_obj.YELLOW)
 
@@ -1942,7 +1952,7 @@ while True:
                 if origin_line in line_list:
                     delete_line(url_config_file, origin_line)
                 line_list.append(origin_line)
-                line = origin_line.strip()
+                line = origin_line.strip().lstrip('\ufeff')  # 兜底清理可能混入的BOM隐藏字符
                 if len(line) < 18:
                     continue
 
@@ -2107,9 +2117,13 @@ while True:
             if removed_url not in all_urls_in_file:
                 if removed_url not in url_comments:
                     url_comments.append(removed_url)
+                if removed_url not in already_notified_removed:
+                    already_notified_removed.add(removed_url)
                     color_obj.print_colored(
                         f"\r检测到URL已从配置文件中删除，正在停止录制: {removed_url}", color_obj.YELLOW
                     )
+            else:
+                already_notified_removed.discard(removed_url)
 
         while len(need_update_line_list):
             a = need_update_line_list.pop()
