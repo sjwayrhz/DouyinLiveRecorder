@@ -26,7 +26,7 @@ REQUEST_TOKEN = Path("/etc/youtube/request.token")
 BASE_DIR = SCRIPT_DIR / "downloads"
 CONFIG_JSON = BIN_DIR / "channels.json"
 MIN_SIZE_MB = 200
-DEFAULT_DESC_FILE = Path("/etc/youtube/description.txt")  # 全局默认简介，可不存在
+DEFAULT_DESC_FILE = BIN_DIR / "desc.txt"  # 全局默认简介，可不存在
 
 # youtubeuploader 下载地址
 YOUTUBEUPLOADER_URL = (
