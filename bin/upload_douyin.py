@@ -128,8 +128,6 @@ def quota_exceeded(text: str) -> bool:
 
 # ================= 主流程 =================
 def main() -> None:
-    # 强制环境编码（Python3 默认按 utf-8 处理字符串，这里仅为对齐原脚本语义，不需要额外设置）
-
     ensure_youtubeuploader()
 
     # --- 参数处理逻辑 ---
@@ -179,13 +177,29 @@ def main() -> None:
 
             filename = file_path.name
 
-            # ================= 1. 文件大小检查 =================
+            # ================= 1. 动态文件检测（是否仍在写入/录制中） =================
             try:
-                file_size_bytes = file_path.stat().st_size
+                size_before = file_path.stat().st_size
             except OSError:
-                file_size_bytes = 0
+                # 文件可能已被其他进程移动/删除，跳过
+                continue
+
+            time.sleep(3)
+
+            try:
+                size_after = file_path.stat().st_size
+            except OSError:
+                # 检测期间文件消失了，跳过
+                continue
+
+            if size_before != size_after:
+                log(f"   [{now_time()}] 跳过动态文件 (正在录制): {filename}")
+                continue
+
+            file_size_bytes = size_after
             file_size_mb = file_size_bytes // (1024 * 1024)
 
+            # ================= 2. 文件大小检查 =================
             if file_size_mb < MIN_SIZE_MB:
                 log(f"   [{now_time()}] 删除小文件: {filename} ({file_size_mb}MB < {MIN_SIZE_MB}MB)")
                 try:
@@ -193,19 +207,6 @@ def main() -> None:
                 except OSError:
                     pass
                 continue
-
-            # ================= 2. TS 动态文件检测 =================
-            if filename.lower().endswith(".ts"):
-                size_before = file_size_bytes
-                time.sleep(3)
-                try:
-                    size_after = file_path.stat().st_size
-                except OSError:
-                    size_after = None
-
-                if size_before is None or size_before != size_after:
-                    log(f"   [{now_time()}] 跳过动态文件 (正在录制): {filename}")
-                    continue
 
             # ================= 3. 执行上传 =================
             log(f"   [{now_time()}] 准备上传: {filename} ({file_size_mb}MB)")
