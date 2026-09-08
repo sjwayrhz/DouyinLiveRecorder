@@ -1,4 +1,4 @@
-﻿# -*- encoding: utf-8 -*-
+# -*- encoding: utf-8 -*-
 
 """
 Author: sjwayrhz
@@ -187,6 +187,33 @@ def get_startup_info(system_type: str):
     return startup_info
 
 
+def _posix_child_preexec():
+    """
+    仅在 POSIX (Linux/macOS) 下生效。
+    通过 prctl(PR_SET_PDEATHSIG) 告诉内核：一旦本进程(main.py)退出——
+    不管是正常退出、收到 SIGTERM，还是被 kill -9 强杀——都自动向
+    这个子进程(ffmpeg)发送 SIGKILL，避免它变成孤儿进程继续录制下去。
+    额外调用 os.setsid() 让子进程独立成新的会话/进程组，避免受到
+    终端信号(如 Ctrl+C)的干扰，也保证 pdeathsig 只精确作用于这一个进程。
+    """
+    try:
+        import ctypes
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        PR_SET_PDEATHSIG = 1
+        libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL)
+    except Exception:
+        pass
+    try:
+        os.setsid()
+    except Exception:
+        pass
+
+
+def get_child_preexec_fn():
+    """POSIX 下返回上面的 preexec_fn，Windows 下返回 None(不支持)。"""
+    return _posix_child_preexec if os.name != 'nt' else None
+
+
 def segment_video(converts_file_path: str, segment_save_file_path: str, segment_format: str, segment_time: str,
                   is_original_delete: bool = True) -> None:
     try:
@@ -365,7 +392,8 @@ def push_message(record_name: str, live_url: str, content: str) -> None:
 def run_script(command: str) -> None:
     try:
         process = subprocess.Popen(
-            command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, startupinfo=get_startup_info(os_type)
+            command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            startupinfo=get_startup_info(os_type), preexec_fn=get_child_preexec_fn()
         )
         stdout, stderr = process.communicate()
         stdout_decoded = stdout.decode('utf-8')
@@ -431,7 +459,8 @@ def check_subprocess(record_name: str, record_url: str, ffmpeg_command: list, sa
                      script_command: str | None = None) -> bool:
     save_file_path = ffmpeg_command[-1]
     process = subprocess.Popen(
-        ffmpeg_command, stdin=subprocess.PIPE, stderr=subprocess.STDOUT, startupinfo=get_startup_info(os_type)
+        ffmpeg_command, stdin=subprocess.PIPE, stderr=subprocess.STDOUT,
+        startupinfo=get_startup_info(os_type), preexec_fn=get_child_preexec_fn()
     )
 
     subs_file_path = save_file_path.rsplit('.', maxsplit=1)[0]
