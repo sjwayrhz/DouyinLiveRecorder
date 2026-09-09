@@ -4,6 +4,8 @@
 
 import json
 import os
+import pty
+import select
 import shutil
 import subprocess
 import sys
@@ -126,6 +128,80 @@ def quota_exceeded(text: str) -> bool:
     return "quotaexceeded" in text.lower()
 
 
+def run_with_live_log(cmd):
+
+    master_out, slave_out = pty.openpty()
+    master_err, slave_err = pty.openpty()
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=slave_out,
+        stderr=slave_err,
+        close_fds=True,
+    )
+    # 父进程不需要 slave 端，关闭它自己持有的副本
+    os.close(slave_out)
+    os.close(slave_err)
+
+    output_chunks = []
+    error_chunks = []
+    buffers = {master_out: "", master_err: ""}
+    open_fds = {master_out, master_err}
+
+    while open_fds:
+        try:
+            readable, _, _ = select.select(list(open_fds), [], [], 0.5)
+        except InterruptedError:
+            continue
+
+        if not readable:
+            if proc.poll() is not None:
+                break
+            continue
+
+        for fd in readable:
+            try:
+                data = os.read(fd, 4096)
+            except OSError:
+                data = b""
+
+            if not data:
+                open_fds.discard(fd)
+                os.close(fd)
+                continue
+
+            text = data.decode("utf-8", errors="replace")
+            buffers[fd] += text
+
+            # 按 \n 或 \r 拆分：\r 用于处理进度条同行刷新的情况，
+            # 这样每次进度更新都能单独写一行到日志里，而不是等到最后。
+            while True:
+                idx_n = buffers[fd].find("\n")
+                idx_r = buffers[fd].find("\r")
+                candidates = [i for i in (idx_n, idx_r) if i != -1]
+                if not candidates:
+                    break
+                idx = min(candidates)
+                line = buffers[fd][:idx]
+                buffers[fd] = buffers[fd][idx + 1:]
+                if line.strip():
+                    log(f"   [{now_time()}] {line.rstrip()}")
+                    (output_chunks if fd == master_out else error_chunks).append(line)
+
+    proc.wait()
+
+    # 冲刷两个缓冲区里残留、没有换行符结尾的最后一段内容
+    for fd, chunks in ((master_out, output_chunks), (master_err, error_chunks)):
+        remainder = buffers.get(fd, "")
+        if remainder.strip():
+            log(f"   [{now_time()}] {remainder.rstrip()}")
+            chunks.append(remainder)
+
+    combined_out = "\n".join(output_chunks)
+    combined_err = "\n".join(error_chunks)
+    return proc.returncode, combined_out, combined_err
+
+
 # ================= 主流程 =================
 def main() -> None:
     ensure_youtubeuploader()
@@ -224,27 +300,16 @@ def main() -> None:
             cmd += ["-filename", str(file_path)]
 
             try:
-                result = subprocess.run(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                )
+                exit_code, stdout_text, stderr_text = run_with_live_log(cmd)
             except Exception as e:
                 log(f"   <<< 调用 youtubeuploader 失败: {e}")
                 continue
 
-            # stdout 追加到日志（原脚本中 stdout 直接 >> LOG_FILE）
-            if result.stdout:
-                log(result.stdout.rstrip())
-            stderr_text = result.stderr or ""
-            if stderr_text:
-                log(stderr_text.rstrip())
-
-            exit_code = result.returncode
+            # 注意：run_with_live_log 内部已经把每一行/每次进度更新实时写入日志了，
+            # 这里不需要再整体 log 一次，避免重复输出。
 
             # 配额检查
-            if quota_exceeded(stderr_text) or quota_exceeded(result.stdout or ""):
+            if quota_exceeded(stderr_text) or quota_exceeded(stdout_text or ""):
                 log("   !!! 配额耗尽，脚本退出 !!!")
                 sys.exit(1)
 
@@ -261,7 +326,7 @@ def main() -> None:
     log(f"----------- 任务结束: {now_full()} -----------")
 
 """
-0 1-21/2 * * * flock -n /tmp/upload_douyin.lock -c "/usr/bin/python3 /root/DouyinLiveRecorder/bin/upload_douyin.py"
+0 1-23/2 * * * flock -n /tmp/upload_douyin.lock -c "/usr/bin/python3 /root/DouyinLiveRecorder/bin/upload_douyin.py"
 
 0 0-22/2 * * * flock -n /tmp/upload_douyin.lock -c "/usr/bin/python3 /root/DouyinLiveRecorder/bin/upload_douyin.py"
 """
