@@ -58,6 +58,21 @@ def now_full() -> str:
     return datetime.now().strftime("%a %b %d %H:%M:%S %Z %Y")
 
 
+def log_raw(text: str) -> None:
+    """写入不追加时间戳、不换行的原始文本。
+    用于进度条这种"同一行刷新"的场景：配合开头的 \r，
+    在终端里（或用 less -R / cat 查看）能覆盖上一次的内容，
+    而不是每次刷新都新增一行。
+    """
+    try:
+        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(text)
+    except Exception as e:
+        print(f"[写日志失败] {e}", file=sys.stderr)
+    print(text, end="", flush=True)
+
+
 # ================= 1. 确保 youtubeuploader 存在 =================
 def ensure_youtubeuploader() -> None:
     if UPLOADER_BIN.exists():
@@ -147,6 +162,11 @@ def run_with_live_log(cmd):
     error_chunks = []
     buffers = {master_out: "", master_err: ""}
     open_fds = {master_out, master_err}
+    # 记录每个 fd 当前是否处于"进度条同行刷新"状态，
+    # 如果是，下次遇到真正的换行(\n)时需要先补一个 \n 收尾。
+    progress_active = {master_out: False, master_err: False}
+    # 进度行本身可能长度不一，末尾补几个空格盖掉上一次残留的字符
+    PAD = " " * 8
 
     while open_fds:
         try:
@@ -173,20 +193,34 @@ def run_with_live_log(cmd):
             text = data.decode("utf-8", errors="replace")
             buffers[fd] += text
 
-            # 按 \n 或 \r 拆分：\r 用于处理进度条同行刷新的情况，
-            # 这样每次进度更新都能单独写一行到日志里，而不是等到最后。
+            # 分别找最近的 \n 和 \r，谁先出现就按谁处理：
+            # - \r 结尾：进度条同行刷新，原地覆盖，不换行
+            # - \n 结尾：真正独立的一行，正常记录并换行
             while True:
                 idx_n = buffers[fd].find("\n")
                 idx_r = buffers[fd].find("\r")
-                candidates = [i for i in (idx_n, idx_r) if i != -1]
-                if not candidates:
+
+                if idx_n == -1 and idx_r == -1:
                     break
-                idx = min(candidates)
-                line = buffers[fd][:idx]
-                buffers[fd] = buffers[fd][idx + 1:]
-                if line.strip():
-                    log(f"   [{now_time()}] {line.rstrip()}")
-                    (output_chunks if fd == master_out else error_chunks).append(line)
+
+                if idx_r != -1 and (idx_n == -1 or idx_r < idx_n):
+                    idx = idx_r
+                    line = buffers[fd][:idx]
+                    buffers[fd] = buffers[fd][idx + 1:]
+                    if line.strip():
+                        log_raw(f"\r   [{now_time()}] {line.rstrip()}{PAD}")
+                        progress_active[fd] = True
+                        (output_chunks if fd == master_out else error_chunks).append(line)
+                else:
+                    idx = idx_n
+                    line = buffers[fd][:idx]
+                    buffers[fd] = buffers[fd][idx + 1:]
+                    if line.strip():
+                        if progress_active[fd]:
+                            log_raw("\n")
+                            progress_active[fd] = False
+                        log(f"   [{now_time()}] {line.rstrip()}")
+                        (output_chunks if fd == master_out else error_chunks).append(line)
 
     proc.wait()
 
@@ -194,8 +228,15 @@ def run_with_live_log(cmd):
     for fd, chunks in ((master_out, output_chunks), (master_err, error_chunks)):
         remainder = buffers.get(fd, "")
         if remainder.strip():
+            if progress_active[fd]:
+                log_raw("\n")
+                progress_active[fd] = False
             log(f"   [{now_time()}] {remainder.rstrip()}")
             chunks.append(remainder)
+        elif progress_active[fd]:
+            # 结尾停留在进度行上，补一个换行让日志文件格式完整
+            log_raw("\n")
+            progress_active[fd] = False
 
     combined_out = "\n".join(output_chunks)
     combined_err = "\n".join(error_chunks)
