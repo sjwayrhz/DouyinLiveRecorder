@@ -13,6 +13,7 @@ import tarfile
 import tempfile
 import time
 import urllib.request
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 
@@ -157,6 +158,8 @@ def run_with_live_log(cmd):
       同行实时刷新；日志文件里逐条记录；同时整体重写 ``STATUS_FILE``，
       想要"只显示一条"的实时进度时，用
       ``watch -n1 cat <项目根目录>/youtube_upload.status`` 查看。
+    - 进度行去重：工具可能把同一条进度输出两次（两路输出流），
+      只保留第一条，重复的丢弃。
     """
 
     master_out, slave_out = pty.openpty()
@@ -178,6 +181,9 @@ def run_with_live_log(cmd):
     open_fds = {master_out, master_err}
 
     term_progress_active = False  # 终端当前是否停留在未换行的进度行上
+    # 最近见过的进度行（窗口去重）：同一条进度可能被输出两次，
+    # 两路流都会被读到，用滑动窗口去重只保留一条。
+    recent_progress = deque(maxlen=32)
 
     def term_newline():
         """如果终端正停留在进度行上，先换行收尾，避免后续输出挤在同一行。"""
@@ -194,6 +200,9 @@ def run_with_live_log(cmd):
         (output_chunks if fd == master_out else error_chunks).append(line)
 
         if is_progress_line(line):
+            if line in recent_progress:
+                return  # 重复的进度行，丢弃
+            recent_progress.append(line)
             # 终端：同行刷新；末尾补空格盖掉上一次残留的字符
             print(f"\r   [{now_time()}] {line}" + " " * 8, end="", flush=True)
             term_progress_active = True
