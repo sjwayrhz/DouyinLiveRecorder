@@ -23,6 +23,8 @@ SCRIPT_DIR = BIN_DIR.parent  # DouyinLiveRecorder 根目录
 
 UPLOADER_BIN = BIN_DIR / "youtubeuploader"
 LOG_FILE = Path("/root/youtube_upload.log")
+# 单行实时状态文件：放在项目根目录，每次进度整体重写，永远只有最新一条
+STATUS_FILE = SCRIPT_DIR / "youtube_upload.status"
 CLIENT_SECRETS = Path("/etc/youtube/client_secrets.json")
 REQUEST_TOKEN = Path("/etc/youtube/request.token")
 BASE_DIR = SCRIPT_DIR / "downloads"
@@ -50,6 +52,20 @@ def log(msg: str) -> None:
     print(msg)
 
 
+def write_status(text: str) -> None:
+    """整体重写状态文件，文件里永远只有一行：最新的上传进度。
+    用临时文件 + 原子替换，避免外部 watch cat 读到写一半的内容。
+    实时查看单行进度：watch -n1 cat <项目根目录>/youtube_upload.status
+    """
+    try:
+        STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = STATUS_FILE.with_name(STATUS_FILE.name + ".tmp")
+        tmp.write_text(text + "\n", encoding="utf-8")
+        os.replace(tmp, STATUS_FILE)
+    except Exception as e:
+        print(f"[写状态失败] {e}", file=sys.stderr)
+
+
 def now_time() -> str:
     return datetime.now().strftime("%H:%M:%S")
 
@@ -58,19 +74,9 @@ def now_full() -> str:
     return datetime.now().strftime("%a %b %d %H:%M:%S %Z %Y")
 
 
-def log_raw(text: str) -> None:
-    """写入不追加时间戳、不换行的原始文本。
-    用于进度条这种"同一行刷新"的场景：配合开头的 \r，
-    在终端里（或用 less -R / cat 查看）能覆盖上一次的内容，
-    而不是每次刷新都新增一行。
-    """
-    try:
-        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with open(LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(text)
-    except Exception as e:
-        print(f"[写日志失败] {e}", file=sys.stderr)
-    print(text, end="", flush=True)
+def is_progress_line(line: str) -> bool:
+    """判断是否为 youtubeuploader 的进度行（Progress: ...）。"""
+    return line.lstrip().startswith("Progress:")
 
 
 # ================= 1. 确保 youtubeuploader 存在 =================
@@ -144,6 +150,14 @@ def quota_exceeded(text: str) -> bool:
 
 
 def run_with_live_log(cmd):
+    """运行命令并实时记录输出，返回 (exit_code, stdout_text, stderr_text)。
+
+    - 普通输出行：实时写入日志文件，同时打印到终端。
+    - 进度行（youtubeuploader 的 ``Progress: ...``）：终端上用 ``\r``
+      同行实时刷新；日志文件里逐条记录；同时整体重写 ``STATUS_FILE``，
+      想要"只显示一条"的实时进度时，用
+      ``watch -n1 cat <项目根目录>/youtube_upload.status`` 查看。
+    """
 
     master_out, slave_out = pty.openpty()
     master_err, slave_err = pty.openpty()
@@ -162,11 +176,35 @@ def run_with_live_log(cmd):
     error_chunks = []
     buffers = {master_out: "", master_err: ""}
     open_fds = {master_out, master_err}
-    # 记录每个 fd 当前是否处于"进度条同行刷新"状态，
-    # 如果是，下次遇到真正的换行(\n)时需要先补一个 \n 收尾。
-    progress_active = {master_out: False, master_err: False}
-    # 进度行本身可能长度不一，末尾补几个空格盖掉上一次残留的字符
-    PAD = " " * 8
+
+    term_progress_active = False  # 终端当前是否停留在未换行的进度行上
+
+    def term_newline():
+        """如果终端正停留在进度行上，先换行收尾，避免后续输出挤在同一行。"""
+        nonlocal term_progress_active
+        if term_progress_active:
+            print(flush=True)
+            term_progress_active = False
+
+    def handle_line(fd, line):
+        nonlocal term_progress_active
+        line = line.rstrip()
+        if not line.strip():
+            return
+        (output_chunks if fd == master_out else error_chunks).append(line)
+
+        if is_progress_line(line):
+            # 终端：同行刷新；末尾补空格盖掉上一次残留的字符
+            print(f"\r   [{now_time()}] {line}" + " " * 8, end="", flush=True)
+            term_progress_active = True
+            # 状态文件：每次进度都整体重写，永远只有最新的一条
+            write_status(f"   [{now_time()}] {line}")
+            # 日志文件：每条进度都如实记录
+            term_newline()
+            log(f"   [{now_time()}] {line}")
+        else:
+            term_newline()
+            log(f"   [{now_time()}] {line}")
 
     while open_fds:
         try:
@@ -191,52 +229,25 @@ def run_with_live_log(cmd):
                 continue
 
             text = data.decode("utf-8", errors="replace")
+            # \r 和 \n 都视为行分隔，兼容 \rtext / text\r / \r\n 等各种进度条写法
+            text = text.replace("\r\n", "\n").replace("\r", "\n")
             buffers[fd] += text
 
-            # 分别找最近的 \n 和 \r，谁先出现就按谁处理：
-            # - \r 结尾：进度条同行刷新，原地覆盖，不换行
-            # - \n 结尾：真正独立的一行，正常记录并换行
-            while True:
-                idx_n = buffers[fd].find("\n")
-                idx_r = buffers[fd].find("\r")
-
-                if idx_n == -1 and idx_r == -1:
-                    break
-
-                if idx_r != -1 and (idx_n == -1 or idx_r < idx_n):
-                    idx = idx_r
-                    line = buffers[fd][:idx]
-                    buffers[fd] = buffers[fd][idx + 1:]
-                    if line.strip():
-                        log_raw(f"\r   [{now_time()}] {line.rstrip()}{PAD}")
-                        progress_active[fd] = True
-                        (output_chunks if fd == master_out else error_chunks).append(line)
-                else:
-                    idx = idx_n
-                    line = buffers[fd][:idx]
-                    buffers[fd] = buffers[fd][idx + 1:]
-                    if line.strip():
-                        if progress_active[fd]:
-                            log_raw("\n")
-                            progress_active[fd] = False
-                        log(f"   [{now_time()}] {line.rstrip()}")
-                        (output_chunks if fd == master_out else error_chunks).append(line)
+            while "\n" in buffers[fd]:
+                line, buffers[fd] = buffers[fd].split("\n", 1)
+                handle_line(fd, line)
 
     proc.wait()
 
     # 冲刷两个缓冲区里残留、没有换行符结尾的最后一段内容
-    for fd, chunks in ((master_out, output_chunks), (master_err, error_chunks)):
+    for fd in (master_out, master_err):
         remainder = buffers.get(fd, "")
         if remainder.strip():
-            if progress_active[fd]:
-                log_raw("\n")
-                progress_active[fd] = False
-            log(f"   [{now_time()}] {remainder.rstrip()}")
-            chunks.append(remainder)
-        elif progress_active[fd]:
-            # 结尾停留在进度行上，补一个换行让日志文件格式完整
-            log_raw("\n")
-            progress_active[fd] = False
+            handle_line(fd, remainder)
+
+    # 状态文件收尾：标明本次上传已结束，避免 stale 的进度一直显示
+    term_newline()
+    write_status(f"   [{now_time()}] 上传结束 (exit={proc.returncode})")
 
     combined_out = "\n".join(output_chunks)
     combined_err = "\n".join(error_chunks)
