@@ -43,14 +43,15 @@ VIDEO_EXTS = ["mp4", "flv", "ts", "mkv", "mov"]
 
 
 # ================= 日志 =================
-def log(msg: str) -> None:
+def log(msg: str, terminal: bool = True) -> None:
     try:
         LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
         with open(LOG_FILE, "a", encoding="utf-8") as f:
             f.write(msg + "\n")
     except Exception as e:
         print(f"[写日志失败] {e}: {msg}", file=sys.stderr)
-    print(msg)
+    if terminal:
+        print(msg)
 
 
 def write_status(text: str) -> None:
@@ -155,8 +156,8 @@ def run_with_live_log(cmd):
 
     - 普通输出行：实时写入日志文件，同时打印到终端。
     - 进度行（youtubeuploader 的 ``Progress: ...``）：终端上用 ``\r``
-      同行实时刷新；日志文件里逐条记录；同时整体重写 ``STATUS_FILE``，
-      想要"只显示一条"的实时进度时，用
+      同行实时刷新，不换行；日志文件里不记录（只保留关键事件）；
+      同时整体重写 ``STATUS_FILE``，想要"只显示一条"的实时进度时，用
       ``watch -n1 cat <项目根目录>/youtube_upload.status`` 查看。
     - 进度行去重：工具可能把同一条进度输出两次（两路输出流），
       只保留第一条，重复的丢弃。
@@ -203,14 +204,13 @@ def run_with_live_log(cmd):
             if line in recent_progress:
                 return  # 重复的进度行，丢弃
             recent_progress.append(line)
-            # 终端：同行刷新；末尾补空格盖掉上一次残留的字符
+            # 终端：同行刷新，不换行；末尾补空格盖掉上一次残留的字符
             print(f"\r   [{now_time()}] {line}" + " " * 8, end="", flush=True)
             term_progress_active = True
             # 状态文件：每次进度都整体重写，永远只有最新的一条
+            # （实时单行进度用 watch -n1 cat youtube_upload.status 查看）
             write_status(f"   [{now_time()}] {line}")
-            # 日志文件：每条进度都如实记录
-            term_newline()
-            log(f"   [{now_time()}] {line}")
+            # 日志文件：进度行不记录，只保留关键事件，避免刷屏
         else:
             term_newline()
             log(f"   [{now_time()}] {line}")
